@@ -20,7 +20,10 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from torch.nn.attention.varlen import varlen_attn
+try:
+    from torch.nn.attention.varlen import varlen_attn
+except ImportError:  # pragma: no cover - optional in older torch versions
+    varlen_attn = None
 from torch.types import Number
 
 
@@ -50,9 +53,12 @@ class VarlenMetadata(NamedTuple):
 
 
 class VarlenAttentionWrapper(torch.nn.Module):
-    _compiled_varlen_attn: ClassVar[Callable] = torch.compile(
-        varlen_attn, mode="max-autotune-no-cudagraphs"
-    )
+    if varlen_attn is None:
+        _compiled_varlen_attn: ClassVar[Callable | None] = None
+    else:
+        _compiled_varlen_attn: ClassVar[Callable] = torch.compile(
+            varlen_attn, mode="max-autotune-no-cudagraphs"
+        )
 
     def forward(
         self,
@@ -62,6 +68,11 @@ class VarlenAttentionWrapper(torch.nn.Module):
         attention_masks: VarlenMetadata,
         scale: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self._compiled_varlen_attn is None:
+            raise RuntimeError(
+                "Varlen attention is not available in this torch version. "
+                "Upgrade to torch 2.10+ or select a different attention type."
+            )
 
         cu_seq_q = attention_masks.cu_seq_q
         cu_seq_k = attention_masks.cu_seq_k
