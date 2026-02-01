@@ -58,7 +58,7 @@ class GptOssStateDictAdapter(MoEStateDictAdapter):
             # If loading checkpoints without quantization, use HuggingFaceStorageReader instead
             return QuantizedHuggingFaceStorageReader(
                 path=path,
-                thread_count=4,
+                thread_count=1,
             )
         else:
             return HuggingFaceStorageReader(path)
