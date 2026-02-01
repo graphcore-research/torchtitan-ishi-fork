@@ -6,6 +6,7 @@
 
 import enum
 import functools
+import math
 import os
 import queue
 import re
@@ -164,6 +165,71 @@ def _ensure_quantized_scale_mapping(reader: Any) -> None:
             weight_scale_mapping[tensor_name] = scale_name
 
 
+def _patch_quantized_hf_reader(reader: Any) -> None:
+    calculate_scale_shape = getattr(reader, "_calculate_scale_shape", None)
+    if not callable(calculate_scale_shape):
+        return
+    if getattr(reader, "_torchtitan_scale_shape_patch", False):
+        return
+
+    def _calculate_scale_shape(weight: torch.Tensor, block_size: int) -> torch.Size:
+        try:
+            return calculate_scale_shape(weight, block_size)
+        except ValueError as exc:
+            if "too many values to unpack" not in str(exc):
+                raise
+            shape = tuple(weight.shape)
+            if len(shape) <= 2:
+                raise
+            *prefix, rows, cols = shape
+            if isinstance(block_size, (tuple, list)):
+                block = int(block_size[-1])
+            else:
+                block = int(block_size)
+            if block <= 0:
+                block = cols
+            scale_cols = int(math.ceil(cols / block))
+            total_rows = rows * math.prod(prefix) if prefix else rows
+            return torch.Size([total_rows, scale_cols])
+
+    reader._calculate_scale_shape = _calculate_scale_shape
+    reader._torchtitan_scale_shape_patch = True
+
+    dequantize_tensor = getattr(reader, "_dequantize_tensor", None)
+    if callable(dequantize_tensor) and not getattr(
+        reader, "_torchtitan_dequantize_patch", False
+    ):
+
+        def _dequantize_tensor(
+            weight: torch.Tensor,
+            scale_inv: torch.Tensor,
+            full_tensor_shape: torch.Size,
+            slice_info: Any,
+        ) -> torch.Tensor:
+            if scale_inv.ndim > 2 and len(full_tensor_shape) == 2:
+                expected_block_rows = math.ceil(
+                    full_tensor_shape[0] / reader.block_size
+                )
+                expected_block_cols = math.ceil(
+                    full_tensor_shape[1] / reader.block_size
+                )
+                expected_numel = expected_block_rows * expected_block_cols
+                if scale_inv.numel() == expected_numel:
+                    scale_inv = scale_inv.reshape(
+                        expected_block_rows, expected_block_cols
+                    )
+                elif scale_inv.shape[-1] == expected_block_cols:
+                    prefix = math.prod(scale_inv.shape[:-1])
+                    if prefix == expected_block_rows:
+                        scale_inv = scale_inv.reshape(
+                            expected_block_rows, expected_block_cols
+                        )
+            return dequantize_tensor(weight, scale_inv, full_tensor_shape, slice_info)
+
+        reader._dequantize_tensor = _dequantize_tensor
+        reader._torchtitan_dequantize_patch = True
+
+
 class _MetadataFixingStorageReader:
     def __init__(
         self, base_reader: Any, expected_shapes: dict[str, torch.Size] | None = None
@@ -195,6 +261,7 @@ class _MetadataFixingStorageReader:
 def _wrap_storage_reader_for_quantized_blocks(
     storage_reader: Any, expected_shapes: dict[str, torch.Size] | None = None
 ) -> Any:
+    _patch_quantized_hf_reader(storage_reader)
     return _MetadataFixingStorageReader(storage_reader, expected_shapes)
 
 
