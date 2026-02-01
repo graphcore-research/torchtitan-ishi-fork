@@ -4,18 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import threading
-from typing import cast, Optional
+from typing import Any, cast, Optional, Protocol
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from torch.distributed.pipelining.schedules import (
-    _Action,
-    _PipelineContext,
-    _PipelineScheduleRuntime,
-    _wait_batch_p2p,
-)
+from torch.distributed.pipelining import schedules as _schedules
 from torch.distributed.pipelining.stage import _PipelineStageBase
 from torch.distributed.tensor import DeviceMesh, distribute_module
 from torch.profiler import record_function
@@ -23,6 +18,17 @@ from torch.profiler import record_function
 from torchtitan.distributed.expert_parallel import BaseExpertParallel
 
 from torchtitan.tools.utils import get_device_info
+
+_Action = _schedules._Action
+_PipelineScheduleRuntime = _schedules._PipelineScheduleRuntime
+_wait_batch_p2p = _schedules._wait_batch_p2p
+
+if hasattr(_schedules, "_PipelineContext"):
+    _PipelineContext = _schedules._PipelineContext
+else:
+
+    class _PipelineContext(Protocol):
+        schedule_ref: Any
 
 """
 Below are optimizations related to pipeline parallelism with expert parallelism
