@@ -11,6 +11,7 @@ from typing import ClassVar, NamedTuple
 
 import torch
 import torch.nn.functional as F
+import torch._inductor.config as inductor_config
 from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.nn.attention.flex_attention import (
     _mask_mod_signature,
@@ -123,15 +124,23 @@ class FlexAttentionWrapper(torch.nn.Module):
         block_mask as a keyword argument to be compatible with _ContextParallel.
     """
 
-    _compiled_flex_attn: ClassVar[Callable] = torch.compile(
-        flex_attention,
-        # This options also encapsulate max-autotune-no-cudagraphs.
-        options={
-            "wrap_inductor_compiled_regions": True,
+    @staticmethod
+    def _compile_options() -> dict[str, bool]:
+        # When available, wrap compiled regions in inductor_compiled_code so they
+        # are visible to TorchDispatchModes like DebugMode or activation checkpointing.
+        options = {
             "max_autotune": True,
             "coordinate_descent_tuning": True,
             "triton.cudagraphs": False,
-        },
+        }
+        if hasattr(inductor_config, "wrap_inductor_compiled_regions"):
+            options["wrap_inductor_compiled_regions"] = True
+        return options
+
+    _compiled_flex_attn: ClassVar[Callable] = torch.compile(
+        flex_attention,
+        # This options also encapsulate max-autotune-no-cudagraphs.
+        options=_compile_options.__func__(),
     )
 
     def forward(
