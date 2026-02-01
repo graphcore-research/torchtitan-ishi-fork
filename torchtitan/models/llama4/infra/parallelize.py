@@ -62,8 +62,9 @@ _op_sac_save_list = {
     # used to compute the scaling factor for quantization.
     torch.ops.aten.max.default,
     torch._higher_order_ops.flex_attention,
-    torch._higher_order_ops.inductor_compiled_code,
 }
+if hasattr(torch._higher_order_ops, "inductor_compiled_code"):
+    _op_sac_save_list.add(torch._higher_order_ops.inductor_compiled_code)
 
 
 def parallelize_llama(
