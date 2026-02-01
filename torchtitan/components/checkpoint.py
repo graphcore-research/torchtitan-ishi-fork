@@ -127,7 +127,9 @@ def _should_retry_with_quantized_reader(exc: BaseException) -> bool:
     return "down_proj_blocks" in message or "gate_up_proj_blocks" in message
 
 
-def _fix_quantized_block_metadata(metadata: Any) -> Any:
+def _fix_quantized_block_metadata(
+    metadata: Any, expected_shapes: dict[str, torch.Size] | None = None
+) -> Any:
     for fqn, tensor_metadata in metadata.state_dict_metadata.items():
         if not isinstance(tensor_metadata, TensorStorageMetadata):
             continue
@@ -136,27 +138,76 @@ def _fix_quantized_block_metadata(metadata: Any) -> Any:
         if len(tensor_metadata.size) < 4:
             continue
         *prefix_shape, groups, block = tensor_metadata.size
-        tensor_metadata.size = torch.Size([*prefix_shape, groups * block * 2])
+        dequantized_size = torch.Size([*prefix_shape, groups * block * 2])
+        if expected_shapes and fqn in expected_shapes:
+            expected_size = expected_shapes[fqn]
+            if expected_size.numel() == dequantized_size.numel():
+                tensor_metadata.size = expected_size
+                continue
+        tensor_metadata.size = dequantized_size
     return metadata
 
 
+def _ensure_quantized_scale_mapping(reader: Any) -> None:
+    weight_map = getattr(reader, "_weight_map", None)
+    weight_scale_mapping = getattr(reader, "_weight_scale_mapping", None)
+    if not isinstance(weight_map, dict) or not isinstance(weight_scale_mapping, dict):
+        return
+    for tensor_name in list(weight_map.keys()):
+        if not tensor_name.endswith("_blocks"):
+            continue
+        scale_name = tensor_name.replace("_blocks", "_scales")
+        if scale_name in weight_map and tensor_name not in weight_scale_mapping:
+            weight_scale_mapping[tensor_name] = scale_name
+
+
 class _MetadataFixingStorageReader:
-    def __init__(self, base_reader: Any) -> None:
+    def __init__(
+        self, base_reader: Any, expected_shapes: dict[str, torch.Size] | None = None
+    ) -> None:
         self._base_reader = base_reader
+        self._expected_shapes = expected_shapes
         self._cached_metadata: Any | None = None
 
     def read_metadata(self, *args: Any, **kwargs: Any) -> Any:
         if self._cached_metadata is None:
             metadata = self._base_reader.read_metadata(*args, **kwargs)
-            self._cached_metadata = _fix_quantized_block_metadata(metadata)
+            _ensure_quantized_scale_mapping(self._base_reader)
+            self._cached_metadata = _fix_quantized_block_metadata(
+                metadata, self._expected_shapes
+            )
+            tensor_full_shapes = getattr(self._base_reader, "_tensor_full_shapes", None)
+            if isinstance(tensor_full_shapes, dict):
+                for fqn, tensor_metadata in metadata.state_dict_metadata.items():
+                    if not fqn.endswith("_blocks"):
+                        continue
+                    if isinstance(tensor_metadata, TensorStorageMetadata):
+                        tensor_full_shapes[fqn] = tensor_metadata.size
         return self._cached_metadata
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base_reader, name)
 
 
-def _wrap_storage_reader_for_quantized_blocks(storage_reader: Any) -> Any:
-    return _MetadataFixingStorageReader(storage_reader)
+def _wrap_storage_reader_for_quantized_blocks(
+    storage_reader: Any, expected_shapes: dict[str, torch.Size] | None = None
+) -> Any:
+    return _MetadataFixingStorageReader(storage_reader, expected_shapes)
+
+
+def _collect_expected_quantized_shapes(
+    state_dict: dict[str, Any],
+) -> dict[str, torch.Size]:
+    expected_shapes: dict[str, torch.Size] = {}
+    for key, value in state_dict.items():
+        if not key.endswith("_blocks"):
+            continue
+        expected_shapes[key] = torch.Size(value.shape)
+    return expected_shapes
+
+
+def _has_quantized_blocks(state_dict: dict[str, Any]) -> bool:
+    return any(key.endswith("_blocks") for key in state_dict)
 
 
 class CheckpointManager:
@@ -496,12 +547,15 @@ class CheckpointManager:
                 self.sd_adapter is not None
             ), "trying to load checkpoint in HF safetensors format, but sd_adapter is not provided."
             hf_state_dict = self.sd_adapter.to_hf(state_dict)
+            if _has_quantized_blocks(hf_state_dict):
+                from_quantized = True
             hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
                 checkpoint_id, from_quantized
             )
             if from_quantized:
+                expected_shapes = _collect_expected_quantized_shapes(hf_state_dict)
                 hf_storage_reader = _wrap_storage_reader_for_quantized_blocks(
-                    hf_storage_reader
+                    hf_storage_reader, expected_shapes
                 )
 
             try:
@@ -519,8 +573,9 @@ class CheckpointManager:
                 hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
                     checkpoint_id, True
                 )
+                expected_shapes = _collect_expected_quantized_shapes(hf_state_dict)
                 hf_storage_reader = _wrap_storage_reader_for_quantized_blocks(
-                    hf_storage_reader
+                    hf_storage_reader, expected_shapes
                 )
                 dcp.load(
                     hf_state_dict,
