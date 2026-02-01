@@ -12,7 +12,6 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import rescale_accumulated_loss
 from torchtitan.config import TORCH_DTYPE_MAP
 
 from torchtitan.distributed import ParallelDims, utils as dist_utils
@@ -158,9 +157,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful):
             job_config.training.local_batch_size * dp_degree
         )
         assert self.gradient_accumulation_steps > 0
-        self.loss_fn = rescale_accumulated_loss(
-            self.loss_fn, self.gradient_accumulation_steps
-        )
+        # Loss scaling is handled within the training loop based on global valid tokens.
 
         # apply parallelisms and initialization
         if parallel_dims.pp_enabled:
