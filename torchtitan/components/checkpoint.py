@@ -357,7 +357,12 @@ def _patch_quantized_hf_reader(reader: Any) -> None:
                 offset_in_first_group = 0
                 if tensor_fqn.endswith("_blocks"):
                     # Determine quantized shape to infer block width.
-                    quantized_shape = safetensor_file.get_slice(tensor_fqn).shape
+                    quantized_slice = safetensor_file.get_slice(tensor_fqn)
+                    quantized_shape = (
+                        quantized_slice.get_shape()
+                        if hasattr(quantized_slice, "get_shape")
+                        else quantized_slice.shape
+                    )
                     block = int(quantized_shape[-1])
                     values_per_group = block * 2
 
