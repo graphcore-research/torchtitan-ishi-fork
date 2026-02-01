@@ -135,6 +135,9 @@ def _fix_quantized_block_metadata(
             continue
         if not fqn.endswith("_blocks"):
             continue
+        if expected_shapes and fqn in expected_shapes:
+            tensor_metadata.size = expected_shapes[fqn]
+            continue
         if len(tensor_metadata.size) < 4:
             continue
         *prefix_shape, groups, block = tensor_metadata.size
