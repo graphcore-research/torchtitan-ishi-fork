@@ -120,8 +120,37 @@ class ParallelDims:
                 if not self._mesh_exist(name, degree):
                     backend_override[name] = "fake"
 
-            return world_mesh._unflatten(
-                0, dim_degrees, dim_names, backend_override=backend_override
+            if hasattr(world_mesh, "_unflatten"):
+                return world_mesh._unflatten(
+                    0, dim_degrees, dim_names, backend_override=backend_override
+                )
+            if hasattr(world_mesh, "unflatten"):
+                try:
+                    return world_mesh.unflatten(
+                        0, dim_degrees, dim_names, backend_override=backend_override
+                    )
+                except TypeError:
+                    return world_mesh.unflatten(0, dim_degrees, dim_names)
+            if hasattr(world_mesh, "_create_unflatten_mesh"):
+                backend_override_tuple = tuple(
+                    (
+                        value
+                        if isinstance(value, tuple)
+                        else (value, None)
+                        if value is not None
+                        else (None, None)
+                    )
+                    for name in dim_names
+                    for value in (backend_override.get(name),)
+                )
+                return world_mesh._create_unflatten_mesh(
+                    0, dim_degrees, dim_names, backend_override_tuple
+                )
+            return init_device_mesh(
+                device_type,
+                dim_degrees,
+                mesh_dim_names=dim_names,
+                backend_override=backend_override,
             )
 
         logger.info(
