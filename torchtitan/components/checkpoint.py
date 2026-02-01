@@ -141,7 +141,13 @@ def _fix_quantized_block_metadata(
         if len(tensor_metadata.size) < 4:
             continue
         *prefix_shape, groups, block = tensor_metadata.size
-        tensor_metadata.size = torch.Size([*prefix_shape, groups * block * 2])
+        dequantized_size = torch.Size([*prefix_shape, groups * block * 2])
+        if expected_shapes and fqn in expected_shapes:
+            expected_size = expected_shapes[fqn]
+            if expected_size.numel() == dequantized_size.numel():
+                tensor_metadata.size = expected_size
+                continue
+        tensor_metadata.size = dequantized_size
     return metadata
 
 
