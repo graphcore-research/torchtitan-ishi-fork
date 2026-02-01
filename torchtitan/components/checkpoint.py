@@ -189,7 +189,8 @@ def _patch_quantized_hf_reader(reader: Any) -> None:
             if block <= 0:
                 block = cols
             scale_cols = int(math.ceil(cols / block))
-            return torch.Size([*prefix, rows, scale_cols])
+            total_rows = rows * math.prod(prefix) if prefix else rows
+            return torch.Size([total_rows, scale_cols])
 
     reader._calculate_scale_shape = _calculate_scale_shape
     reader._torchtitan_scale_shape_patch = True
