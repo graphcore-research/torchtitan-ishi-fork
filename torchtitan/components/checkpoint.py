@@ -195,6 +195,40 @@ def _patch_quantized_hf_reader(reader: Any) -> None:
     reader._calculate_scale_shape = _calculate_scale_shape
     reader._torchtitan_scale_shape_patch = True
 
+    dequantize_tensor = getattr(reader, "_dequantize_tensor", None)
+    if callable(dequantize_tensor) and not getattr(
+        reader, "_torchtitan_dequantize_patch", False
+    ):
+
+        def _dequantize_tensor(
+            weight: torch.Tensor,
+            scale_inv: torch.Tensor,
+            full_tensor_shape: torch.Size,
+            slice_info: Any,
+        ) -> torch.Tensor:
+            if scale_inv.ndim > 2 and len(full_tensor_shape) == 2:
+                expected_block_rows = math.ceil(
+                    full_tensor_shape[0] / reader.block_size
+                )
+                expected_block_cols = math.ceil(
+                    full_tensor_shape[1] / reader.block_size
+                )
+                expected_numel = expected_block_rows * expected_block_cols
+                if scale_inv.numel() == expected_numel:
+                    scale_inv = scale_inv.reshape(
+                        expected_block_rows, expected_block_cols
+                    )
+                elif scale_inv.shape[-1] == expected_block_cols:
+                    prefix = math.prod(scale_inv.shape[:-1])
+                    if prefix == expected_block_rows:
+                        scale_inv = scale_inv.reshape(
+                            expected_block_rows, expected_block_cols
+                        )
+            return dequantize_tensor(weight, scale_inv, full_tensor_shape, slice_info)
+
+        reader._dequantize_tensor = _dequantize_tensor
+        reader._torchtitan_dequantize_patch = True
+
 
 class _MetadataFixingStorageReader:
     def __init__(
