@@ -23,6 +23,7 @@ from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
 )
+from torch.distributed.checkpoint.api import CheckpointException
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -116,6 +117,13 @@ def purge_thread(purge_queue: queue.Queue):
             )
     finally:
         logger.info("Destroying the purge thread.")
+
+
+def _should_retry_with_quantized_reader(exc: BaseException) -> bool:
+    message = str(exc)
+    if "Size mismatch between saved" not in message:
+        return False
+    return "down_proj_blocks" in message or "gate_up_proj_blocks" in message
 
 
 class CheckpointManager:
@@ -459,10 +467,25 @@ class CheckpointManager:
                 checkpoint_id, from_quantized
             )
 
-            dcp.load(
-                hf_state_dict,
-                storage_reader=hf_storage_reader,
-            )
+            try:
+                dcp.load(
+                    hf_state_dict,
+                    storage_reader=hf_storage_reader,
+                )
+            except CheckpointException as exc:
+                if from_quantized or not _should_retry_with_quantized_reader(exc):
+                    raise
+                logger.warning(
+                    "Detected quantized GPT-OSS checkpoint layout. Retrying load with "
+                    "QuantizedHuggingFaceStorageReader."
+                )
+                hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
+                    checkpoint_id, True
+                )
+                dcp.load(
+                    hf_state_dict,
+                    storage_reader=hf_storage_reader,
+                )
 
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
             self.states[MODEL].load_state_dict(state_dict)
