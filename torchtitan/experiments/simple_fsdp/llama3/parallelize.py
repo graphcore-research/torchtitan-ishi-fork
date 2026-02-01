@@ -19,6 +19,13 @@ from ..backend import get_compile_backend_with_passes
 from ..simple_fsdp import data_parallel, MixedPrecisionPolicy
 
 
+def _get_varlen_attn_op():
+    try:
+        return torch.ops.torch_attn._varlen_attn
+    except AttributeError:
+        return None
+
+
 # for selective op activation checkpointing
 _op_sac_save_list = {
     torch.ops.aten.mm.default,
@@ -33,9 +40,11 @@ _op_sac_save_list = {
     # used to compute the scaling factor for quantization.
     torch.ops.aten.max.default,
     torch._higher_order_ops.flex_attention,
-    torch.ops.torch_attn._varlen_attn,
     torch._higher_order_ops.inductor_compiled_code,
 }
+_varlen_attn_op = _get_varlen_attn_op()
+if _varlen_attn_op is not None:
+    _op_sac_save_list.add(_varlen_attn_op)
 
 
 def get_transformer_block_buckets(model) -> list[list[str] | str]:
