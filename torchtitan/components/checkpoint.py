@@ -24,6 +24,7 @@ from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
 )
 from torch.distributed.checkpoint.api import CheckpointException
+from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
@@ -124,6 +125,38 @@ def _should_retry_with_quantized_reader(exc: BaseException) -> bool:
     if "Size mismatch between saved" not in message:
         return False
     return "down_proj_blocks" in message or "gate_up_proj_blocks" in message
+
+
+def _fix_quantized_block_metadata(metadata: Any) -> Any:
+    for fqn, tensor_metadata in metadata.state_dict_metadata.items():
+        if not isinstance(tensor_metadata, TensorStorageMetadata):
+            continue
+        if not fqn.endswith("_blocks"):
+            continue
+        if len(tensor_metadata.size) < 4:
+            continue
+        *prefix_shape, groups, block = tensor_metadata.size
+        tensor_metadata.size = torch.Size([*prefix_shape, groups * block * 2])
+    return metadata
+
+
+class _MetadataFixingStorageReader:
+    def __init__(self, base_reader: Any) -> None:
+        self._base_reader = base_reader
+        self._cached_metadata: Any | None = None
+
+    def read_metadata(self, *args: Any, **kwargs: Any) -> Any:
+        if self._cached_metadata is None:
+            metadata = self._base_reader.read_metadata(*args, **kwargs)
+            self._cached_metadata = _fix_quantized_block_metadata(metadata)
+        return self._cached_metadata
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base_reader, name)
+
+
+def _wrap_storage_reader_for_quantized_blocks(storage_reader: Any) -> Any:
+    return _MetadataFixingStorageReader(storage_reader)
 
 
 class CheckpointManager:
@@ -466,6 +499,10 @@ class CheckpointManager:
             hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
                 checkpoint_id, from_quantized
             )
+            if from_quantized:
+                hf_storage_reader = _wrap_storage_reader_for_quantized_blocks(
+                    hf_storage_reader
+                )
 
             try:
                 dcp.load(
@@ -481,6 +518,9 @@ class CheckpointManager:
                 )
                 hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
                     checkpoint_id, True
+                )
+                hf_storage_reader = _wrap_storage_reader_for_quantized_blocks(
+                    hf_storage_reader
                 )
                 dcp.load(
                     hf_state_dict,
