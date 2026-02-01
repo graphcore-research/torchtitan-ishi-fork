@@ -127,11 +127,16 @@ def _should_retry_with_quantized_reader(exc: BaseException) -> bool:
     return "down_proj_blocks" in message or "gate_up_proj_blocks" in message
 
 
-def _fix_quantized_block_metadata(metadata: Any) -> Any:
+def _fix_quantized_block_metadata(
+    metadata: Any, expected_shapes: dict[str, torch.Size] | None = None
+) -> Any:
     for fqn, tensor_metadata in metadata.state_dict_metadata.items():
         if not isinstance(tensor_metadata, TensorStorageMetadata):
             continue
         if not fqn.endswith("_blocks"):
+            continue
+        if expected_shapes and fqn in expected_shapes:
+            tensor_metadata.size = expected_shapes[fqn]
             continue
         if len(tensor_metadata.size) < 4:
             continue
@@ -141,22 +146,46 @@ def _fix_quantized_block_metadata(metadata: Any) -> Any:
 
 
 class _MetadataFixingStorageReader:
-    def __init__(self, base_reader: Any) -> None:
+    def __init__(
+        self, base_reader: Any, expected_shapes: dict[str, torch.Size] | None = None
+    ) -> None:
         self._base_reader = base_reader
+        self._expected_shapes = expected_shapes
         self._cached_metadata: Any | None = None
 
     def read_metadata(self, *args: Any, **kwargs: Any) -> Any:
         if self._cached_metadata is None:
             metadata = self._base_reader.read_metadata(*args, **kwargs)
-            self._cached_metadata = _fix_quantized_block_metadata(metadata)
+            self._cached_metadata = _fix_quantized_block_metadata(
+                metadata, self._expected_shapes
+            )
         return self._cached_metadata
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._base_reader, name)
 
 
-def _wrap_storage_reader_for_quantized_blocks(storage_reader: Any) -> Any:
-    return _MetadataFixingStorageReader(storage_reader)
+def _wrap_storage_reader_for_quantized_blocks(
+    storage_reader: Any, expected_shapes: dict[str, torch.Size] | None = None
+) -> Any:
+    return _MetadataFixingStorageReader(storage_reader, expected_shapes)
+
+
+def _collect_expected_quantized_shapes(
+    state_dict: dict[str, Any],
+) -> dict[str, torch.Size]:
+    expected_shapes: dict[str, torch.Size] = {}
+    for key, value in state_dict.items():
+        if not key.endswith("_blocks"):
+            continue
+        tensor = value
+        if hasattr(tensor, "to_local"):
+            try:
+                tensor = tensor.to_local()
+            except Exception:
+                tensor = value
+        expected_shapes[key] = torch.Size(tensor.shape)
+    return expected_shapes
 
 
 class CheckpointManager:
@@ -500,8 +529,9 @@ class CheckpointManager:
                 checkpoint_id, from_quantized
             )
             if from_quantized:
+                expected_shapes = _collect_expected_quantized_shapes(hf_state_dict)
                 hf_storage_reader = _wrap_storage_reader_for_quantized_blocks(
-                    hf_storage_reader
+                    hf_storage_reader, expected_shapes
                 )
 
             try:
@@ -519,8 +549,9 @@ class CheckpointManager:
                 hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
                     checkpoint_id, True
                 )
+                expected_shapes = _collect_expected_quantized_shapes(hf_state_dict)
                 hf_storage_reader = _wrap_storage_reader_for_quantized_blocks(
-                    hf_storage_reader
+                    hf_storage_reader, expected_shapes
                 )
                 dcp.load(
                     hf_state_dict,
