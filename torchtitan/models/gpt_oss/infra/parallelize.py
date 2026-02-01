@@ -39,6 +39,10 @@ from .expert_parallel import GptossExpertTensorParallel, GptossTensorParallel
 
 
 # for selective op activation checkpointing
+def _get_higher_order_op(name: str):
+    return getattr(torch._higher_order_ops, name, None)
+
+
 _op_sac_save_list = {
     torch.ops.aten.mm.default,
     torch.ops.aten._scaled_dot_product_efficient_attention.default,
@@ -52,9 +56,13 @@ _op_sac_save_list = {
     # the result of max, since the absolute maximum is
     # used to compute the scaling factor for quantization.
     torch.ops.aten.max.default,
-    torch._higher_order_ops.flex_attention,
-    torch._higher_order_ops.inductor_compiled_code,
 }
+_flex_attention_op = _get_higher_order_op("flex_attention")
+if _flex_attention_op is not None:
+    _op_sac_save_list.add(_flex_attention_op)
+_inductor_compiled_code_op = _get_higher_order_op("inductor_compiled_code")
+if _inductor_compiled_code_op is not None:
+    _op_sac_save_list.add(_inductor_compiled_code_op)
 
 
 # Adapted from llama4/infra/parallelize.py
