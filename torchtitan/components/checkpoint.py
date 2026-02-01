@@ -145,6 +145,19 @@ def _fix_quantized_block_metadata(
     return metadata
 
 
+def _ensure_quantized_scale_mapping(reader: Any) -> None:
+    weight_map = getattr(reader, "_weight_map", None)
+    weight_scale_mapping = getattr(reader, "_weight_scale_mapping", None)
+    if not isinstance(weight_map, dict) or not isinstance(weight_scale_mapping, dict):
+        return
+    for tensor_name in list(weight_map.keys()):
+        if not tensor_name.endswith("_blocks"):
+            continue
+        scale_name = tensor_name.replace("_blocks", "_scales")
+        if scale_name in weight_map and tensor_name not in weight_scale_mapping:
+            weight_scale_mapping[tensor_name] = scale_name
+
+
 class _MetadataFixingStorageReader:
     def __init__(
         self, base_reader: Any, expected_shapes: dict[str, torch.Size] | None = None
@@ -156,6 +169,7 @@ class _MetadataFixingStorageReader:
     def read_metadata(self, *args: Any, **kwargs: Any) -> Any:
         if self._cached_metadata is None:
             metadata = self._base_reader.read_metadata(*args, **kwargs)
+            _ensure_quantized_scale_mapping(self._base_reader)
             self._cached_metadata = _fix_quantized_block_metadata(
                 metadata, self._expected_shapes
             )
