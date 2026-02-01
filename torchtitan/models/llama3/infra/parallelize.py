@@ -32,6 +32,13 @@ from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.tools.logging import logger
 
 
+def _get_varlen_attn_op():
+    try:
+        return torch.ops.torch_attn._varlen_attn.default
+    except AttributeError:
+        return None
+
+
 # for selective op activation checkpointing
 _op_sac_save_list = {
     torch.ops.aten.mm.default,
@@ -46,9 +53,11 @@ _op_sac_save_list = {
     # used to compute the scaling factor for quantization.
     torch.ops.aten.max.default,
     torch._higher_order_ops.flex_attention,
-    torch.ops.torch_attn._varlen_attn.default,
     torch._higher_order_ops.inductor_compiled_code,
 }
+_varlen_attn_op = _get_varlen_attn_op()
+if _varlen_attn_op is not None:
+    _op_sac_save_list.add(_varlen_attn_op)
 
 
 def parallelize_llama(
