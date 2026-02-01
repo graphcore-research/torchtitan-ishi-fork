@@ -6,6 +6,7 @@
 
 import enum
 import functools
+import inspect
 import math
 import os
 import queue
@@ -200,13 +201,21 @@ def _patch_quantized_hf_reader(reader: Any) -> None:
         reader, "_torchtitan_dequantize_patch", False
     ):
 
+        signature = inspect.signature(dequantize_tensor)
+        expects_full_shape = len(signature.parameters) >= 3
+
         def _dequantize_tensor(
             weight: torch.Tensor,
             scale_inv: torch.Tensor,
-            full_tensor_shape: torch.Size,
-            slice_info: Any,
+            full_tensor_shape: torch.Size | None = None,
+            slice_info: Any | None = None,
         ) -> torch.Tensor:
-            if scale_inv.ndim > 2 and len(full_tensor_shape) == 2:
+            if (
+                expects_full_shape
+                and full_tensor_shape is not None
+                and scale_inv.ndim > 2
+                and len(full_tensor_shape) == 2
+            ):
                 expected_block_rows = math.ceil(
                     full_tensor_shape[0] / reader.block_size
                 )
@@ -224,7 +233,11 @@ def _patch_quantized_hf_reader(reader: Any) -> None:
                         scale_inv = scale_inv.reshape(
                             expected_block_rows, expected_block_cols
                         )
-            return dequantize_tensor(weight, scale_inv, full_tensor_shape, slice_info)
+            if expects_full_shape:
+                return dequantize_tensor(
+                    weight, scale_inv, full_tensor_shape, slice_info
+                )
+            return dequantize_tensor(weight, scale_inv)
 
         reader._dequantize_tensor = _dequantize_tensor
         reader._torchtitan_dequantize_patch = True
