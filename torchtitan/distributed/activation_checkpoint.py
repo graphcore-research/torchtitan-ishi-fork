@@ -220,8 +220,15 @@ def apply_ac(
     # here is to disable the LRU cache, and select graphs in insertion order instead.
     #
     # Also see: https://github.com/pytorch/pytorch/issues/166926
-    # pyrefly: ignore [missing-attribute]
-    torch._C._dynamo.eval_frame._set_lru_cache(False)
+    eval_frame = torch._C._dynamo.eval_frame
+    set_lru_cache = getattr(eval_frame, "_set_lru_cache", None)
+    if callable(set_lru_cache):
+        set_lru_cache(False)
+    else:
+        logger.debug(
+            "torch._C._dynamo.eval_frame._set_lru_cache is unavailable; "
+            "skipping dynamo LRU cache disable."
+        )
 
     if ac_config.mode == "memory_budget":
         assert model_compile_enabled, "Memory budget mode requires model to be compiled"
