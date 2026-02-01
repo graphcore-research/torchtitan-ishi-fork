@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
+import inspect
 import math
 import os
 from abc import abstractmethod
@@ -347,11 +348,31 @@ def init_distributed(
         os.makedirs(dump_dir, exist_ok=True)
         _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/{prefix}")
 
-    torch.distributed.init_process_group(
-        backend=_get_distributed_backend(enable_cpu_backend),
-        timeout=timedelta(seconds=comm_config.init_timeout_seconds),
-        _ranks=ranks if ranks is not None else [],
+    init_pg_kwargs = {
+        "backend": _get_distributed_backend(enable_cpu_backend),
+        "timeout": timedelta(seconds=comm_config.init_timeout_seconds),
+    }
+    supports_ranks = (
+        "_ranks" in inspect.signature(torch.distributed.init_process_group).parameters
     )
+    if supports_ranks:
+        init_pg_kwargs["_ranks"] = ranks if ranks is not None else []
+    elif ranks:
+        if "WORLD_SIZE" not in os.environ:
+            raise RuntimeError(
+                "init_process_group does not accept _ranks in this PyTorch version, "
+                "but a rank subset was requested and WORLD_SIZE is not set."
+            )
+        world_size = int(os.environ["WORLD_SIZE"])
+        expected_ranks = list(range(world_size))
+        if list(ranks) != expected_ranks:
+            raise RuntimeError(
+                "init_process_group does not accept _ranks in this PyTorch version. "
+                "Please upgrade to PyTorch >= 2.10 to initialize a rank subset, "
+                "or ensure ranks covers the full WORLD_SIZE."
+            )
+
+    torch.distributed.init_process_group(**init_pg_kwargs)
 
     return torch.distributed.get_world_size()
 
