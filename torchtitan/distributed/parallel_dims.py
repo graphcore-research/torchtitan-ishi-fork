@@ -146,7 +146,12 @@ class ParallelDims:
                 return world_mesh._create_unflatten_mesh(
                     0, dim_degrees, dim_names, backend_override_tuple
                 )
-            raise AttributeError("DeviceMesh does not support unflatten.")
+            return init_device_mesh(
+                device_type,
+                dim_degrees,
+                mesh_dim_names=dim_names,
+                backend_override=backend_override,
+            )
 
         logger.info(
             f"Building device mesh with parallelism: "
