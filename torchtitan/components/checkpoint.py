@@ -179,6 +179,13 @@ class _MetadataFixingStorageReader:
             self._cached_metadata = _fix_quantized_block_metadata(
                 metadata, self._expected_shapes
             )
+            tensor_full_shapes = getattr(self._base_reader, "_tensor_full_shapes", None)
+            if isinstance(tensor_full_shapes, dict):
+                for fqn, tensor_metadata in metadata.state_dict_metadata.items():
+                    if not fqn.endswith("_blocks"):
+                        continue
+                    if isinstance(tensor_metadata, TensorStorageMetadata):
+                        tensor_full_shapes[fqn] = tensor_metadata.size
         return self._cached_metadata
 
     def __getattr__(self, name: str) -> Any:
@@ -200,6 +207,10 @@ def _collect_expected_quantized_shapes(
             continue
         expected_shapes[key] = torch.Size(value.shape)
     return expected_shapes
+
+
+def _has_quantized_blocks(state_dict: dict[str, Any]) -> bool:
+    return any(key.endswith("_blocks") for key in state_dict)
 
 
 class CheckpointManager:
@@ -539,6 +550,8 @@ class CheckpointManager:
                 self.sd_adapter is not None
             ), "trying to load checkpoint in HF safetensors format, but sd_adapter is not provided."
             hf_state_dict = self.sd_adapter.to_hf(state_dict)
+            if _has_quantized_blocks(hf_state_dict):
+                from_quantized = True
             hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
                 checkpoint_id, from_quantized
             )
