@@ -6,6 +6,7 @@
 
 import enum
 import functools
+import inspect
 import math
 import os
 import queue
@@ -14,6 +15,7 @@ import shutil
 import threading
 import time
 from concurrent.futures import Future
+from pathlib import Path
 from typing import Any, cast
 
 import torch
@@ -200,13 +202,21 @@ def _patch_quantized_hf_reader(reader: Any) -> None:
         reader, "_torchtitan_dequantize_patch", False
     ):
 
+        signature = inspect.signature(dequantize_tensor)
+        expects_full_shape = len(signature.parameters) >= 3
+
         def _dequantize_tensor(
             weight: torch.Tensor,
             scale_inv: torch.Tensor,
-            full_tensor_shape: torch.Size,
-            slice_info: Any,
+            full_tensor_shape: torch.Size | None = None,
+            slice_info: Any | None = None,
         ) -> torch.Tensor:
-            if scale_inv.ndim > 2 and len(full_tensor_shape) == 2:
+            if (
+                expects_full_shape
+                and full_tensor_shape is not None
+                and scale_inv.ndim > 2
+                and len(full_tensor_shape) == 2
+            ):
                 expected_block_rows = math.ceil(
                     full_tensor_shape[0] / reader.block_size
                 )
@@ -224,10 +234,219 @@ def _patch_quantized_hf_reader(reader: Any) -> None:
                         scale_inv = scale_inv.reshape(
                             expected_block_rows, expected_block_cols
                         )
-            return dequantize_tensor(weight, scale_inv, full_tensor_shape, slice_info)
+            if expects_full_shape:
+                return dequantize_tensor(
+                    weight, scale_inv, full_tensor_shape, slice_info
+                )
+            return dequantize_tensor(weight, scale_inv)
 
         reader._dequantize_tensor = _dequantize_tensor
         reader._torchtitan_dequantize_patch = True
+
+    if getattr(reader, "_torchtitan_quantized_reader_patch", False):
+        return
+
+    if not hasattr(reader, "_tensor_full_shapes"):
+        reader._tensor_full_shapes = {}
+
+    if not callable(getattr(reader, "_dequantize_tensor_mxfp4", None)):
+
+        def _dequantize_tensor_mxfp4(
+            blocks: torch.Tensor,
+            scales: torch.Tensor,
+            req: Any,
+            group_start: int,
+            offset_in_first_group: int,
+        ) -> torch.Tensor:
+            # Adapted from PyTorch 2.10 implementation.
+            fp4_values = [
+                +0.0,
+                +0.5,
+                +1.0,
+                +1.5,
+                +2.0,
+                +3.0,
+                +4.0,
+                +6.0,
+                -0.0,
+                -0.5,
+                -1.0,
+                -1.5,
+                -2.0,
+                -3.0,
+                -4.0,
+                -6.0,
+            ]
+
+            dim0_start = req.storage_offsets[0]
+            dim0_end = dim0_start + req.lengths[0]
+            dim1_start = req.storage_offsets[1]
+            dim1_end = dim1_start + req.lengths[1]
+            num_groups = blocks.shape[2]
+            scales = scales[
+                dim0_start:dim0_end,
+                dim1_start:dim1_end,
+                group_start : group_start + num_groups,
+            ]
+
+            scales = scales.to(torch.int32) - 127
+
+            if blocks.shape[:-1] != scales.shape:
+                raise ValueError(
+                    f"{blocks.shape=} does not match {scales.shape=} for MXFP4"
+                )
+
+            lut = torch.tensor(
+                fp4_values, dtype=reader.target_dtype, device=blocks.device
+            )
+
+            *prefix_shape, groups, block = blocks.shape
+            rows_total = math.prod(prefix_shape) * groups
+
+            blocks = blocks.reshape(rows_total, block)
+            scales = scales.reshape(rows_total, 1)
+
+            out = torch.empty(
+                rows_total, block * 2, dtype=reader.target_dtype, device=blocks.device
+            )
+
+            rows_per_chunk = 16384 * 512
+
+            for r0 in range(0, rows_total, rows_per_chunk):
+                r1 = min(r0 + rows_per_chunk, rows_total)
+
+                blk = blocks[r0:r1]
+                exp = scales[r0:r1]
+
+                idx_lo = (blk & 0x0F).to(torch.long)
+                idx_hi = (blk >> 4).to(torch.long)
+
+                sub = out[r0:r1]
+                sub[:, 0::2] = lut[idx_lo]
+                sub[:, 1::2] = lut[idx_hi]
+
+                torch.ldexp(sub, exp, out=sub)
+
+                del idx_lo, idx_hi, blk, exp
+
+            result = out.reshape(*prefix_shape, groups, block * 2).view(
+                *prefix_shape, groups * block * 2
+            )
+
+            if offset_in_first_group > 0 or result.shape[-1] > req.lengths[2]:
+                end_offset = offset_in_first_group + req.lengths[2]
+                result = result[..., offset_in_first_group:end_offset]
+
+            return result
+
+        reader._dequantize_tensor_mxfp4 = _dequantize_tensor_mxfp4
+
+    read_quantized_tensor = getattr(reader, "_read_quantized_tensor_with_block_alignment")
+    if callable(read_quantized_tensor) and not getattr(
+        reader, "_torchtitan_read_quantized_patch", False
+    ):
+
+        def _read_quantized_tensor_with_block_alignment(
+            req: Any, safetensor_file: Any
+        ) -> torch.Tensor:
+            tensor_fqn = req.storage_index.fqn
+            scale_fqn = reader._weight_scale_mapping[tensor_fqn]
+
+            try:
+                group_start = 0
+                offset_in_first_group = 0
+                if tensor_fqn.endswith("_blocks"):
+                    # Determine quantized shape to infer block width.
+                    quantized_shape = safetensor_file.get_slice(tensor_fqn).shape
+                    block = int(quantized_shape[-1])
+                    values_per_group = block * 2
+
+                    assert len(req.storage_offsets) == 3
+                    dim2_start_deq = req.storage_offsets[2]
+                    dim2_length_deq = req.lengths[2]
+                    dim2_end_deq = dim2_start_deq + dim2_length_deq
+
+                    group_start = dim2_start_deq // values_per_group
+                    group_end = (dim2_end_deq + values_per_group - 1) // values_per_group
+
+                    weight_slices_4d = (
+                        slice(
+                            req.storage_offsets[0],
+                            req.storage_offsets[0] + req.lengths[0],
+                        ),
+                        slice(
+                            req.storage_offsets[1],
+                            req.storage_offsets[1] + req.lengths[1],
+                        ),
+                        slice(group_start, group_end),
+                        slice(None),
+                    )
+                    quantized_tensor = safetensor_file.get_slice(tensor_fqn)[
+                        weight_slices_4d
+                    ]
+
+                    offset_in_first_group = dim2_start_deq - (
+                        group_start * values_per_group
+                    )
+                else:
+                    weight_slices = tuple(
+                        slice(offset, offset + length)
+                        for offset, length in zip(req.storage_offsets, req.lengths)
+                    )
+                    quantized_tensor = safetensor_file.get_slice(tensor_fqn)[weight_slices]
+
+                scale_file_name = reader._weight_map.get(scale_fqn)
+                if scale_file_name is None:
+                    raise ValueError(
+                        f"Scale tensor {scale_fqn} not found in weight_map"
+                    )
+
+                weight_file_name = reader._weight_map.get(tensor_fqn)
+                if scale_file_name == weight_file_name:
+                    scale_inv = safetensor_file.get_tensor(scale_fqn)
+                else:
+                    from safetensors import safe_open  # type: ignore[import]
+
+                    scale_file_path = Path(reader.path) / scale_file_name
+                    with safe_open(
+                        scale_file_path, framework="pt", device="cpu"
+                    ) as scale_file:
+                        scale_inv = scale_file.get_tensor(scale_fqn)
+
+                if tensor_fqn.endswith("_blocks"):
+                    return reader._dequantize_tensor_mxfp4(
+                        blocks=quantized_tensor,
+                        scales=scale_inv,
+                        req=req,
+                        group_start=group_start,
+                        offset_in_first_group=offset_in_first_group,
+                    )
+
+                return reader._dequantize_tensor(weight=quantized_tensor, scale_inv=scale_inv)
+
+            except Exception as exc:
+                logger.error("Failed to read the quantized tensor!!")
+                raise exc
+
+        reader._read_quantized_tensor_with_block_alignment = (
+            _read_quantized_tensor_with_block_alignment
+        )
+        reader._torchtitan_read_quantized_patch = True
+
+    is_tensor_quantized = getattr(reader, "_is_tensor_quantized", None)
+    if callable(is_tensor_quantized) and not getattr(
+        reader, "_torchtitan_is_quantized_patch", False
+    ):
+
+        def _is_tensor_quantized(tensor_fqn: str) -> bool:
+            if tensor_fqn.endswith((".weight_scale_inv", "_scales")):
+                return False
+            return tensor_fqn in reader._weight_scale_mapping
+
+        reader._is_tensor_quantized = _is_tensor_quantized
+        reader._torchtitan_is_quantized_patch = True
+
+    reader._torchtitan_quantized_reader_patch = True
 
 
 class _MetadataFixingStorageReader:
