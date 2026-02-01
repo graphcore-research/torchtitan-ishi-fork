@@ -178,13 +178,7 @@ def _collect_expected_quantized_shapes(
     for key, value in state_dict.items():
         if not key.endswith("_blocks"):
             continue
-        tensor = value
-        if hasattr(tensor, "to_local"):
-            try:
-                tensor = tensor.to_local()
-            except Exception:
-                tensor = value
-        expected_shapes[key] = torch.Size(tensor.shape)
+        expected_shapes[key] = torch.Size(value.shape)
     return expected_shapes
 
 
