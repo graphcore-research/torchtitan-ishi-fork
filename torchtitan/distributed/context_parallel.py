@@ -10,18 +10,39 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor.experimental._attention import (
-    _context_parallel_shard,
-    _ContextParallel,
-    _enable_context_parallel_dispatcher,
-    _HeadTailLoadBalancer,
-    _PTRRLoadBalancer,
-)
+from torch.distributed.tensor.experimental import _attention as _dtensor_attention
 from torch.distributed.tensor.parallel import parallelize_module
 from torch.nn.attention.flex_attention import BlockMask
 
 from torchtitan.protocols.model import AttentionMasksType
 from torchtitan.tools.logging import logger
+
+_context_parallel_shard = getattr(_dtensor_attention, "_context_parallel_shard", None)
+_ContextParallel = getattr(_dtensor_attention, "_ContextParallel", None)
+_enable_context_parallel_dispatcher = getattr(
+    _dtensor_attention, "_enable_context_parallel_dispatcher", None
+)
+_HeadTailLoadBalancer = getattr(_dtensor_attention, "_HeadTailLoadBalancer", None)
+_PTRRLoadBalancer = getattr(_dtensor_attention, "_PTRRLoadBalancer", None)
+
+_CONTEXT_PARALLEL_AVAILABLE = all(
+    callable(dep)
+    for dep in (
+        _context_parallel_shard,
+        _ContextParallel,
+        _enable_context_parallel_dispatcher,
+        _HeadTailLoadBalancer,
+        _PTRRLoadBalancer,
+    )
+)
+
+
+def _require_context_parallel_support() -> None:
+    if not _CONTEXT_PARALLEL_AVAILABLE:
+        raise RuntimeError(
+            "Context Parallel APIs are unavailable in this PyTorch version. "
+            "Please upgrade to a newer PyTorch release to enable CP."
+        )
 
 
 def apply_cp_to_attention_module(
@@ -47,6 +68,7 @@ def apply_cp_to_attention_module(
     Raises:
         NotImplementedError: If attention_type is "varlen"
     """
+    _require_context_parallel_support()
     # Apply context parallelism to every attention module
     # TODO: make seq_dim configurable once the implementation doesn't assume 2
     # internally.
@@ -177,6 +199,7 @@ def cp_shard(
         ValueError: If load_balancer_type is "ptrr" and attention_masks
             is None or a dict
     """
+    _require_context_parallel_support()
     seq_len = inputs[0].size(input_seq_dim)
     cp_world_size = cp_mesh.size(0)
 
