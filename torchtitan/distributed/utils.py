@@ -9,7 +9,7 @@ import inspect
 import math
 import os
 from abc import abstractmethod
-from collections.abc import Iterable
+from collections.abc import Generator, Iterable
 from datetime import timedelta
 from typing import Protocol
 
@@ -225,16 +225,24 @@ def create_context_parallel_ctx(
 
 class TrainContext(Protocol):
     @abstractmethod
-    def __call__(self) -> contextlib.AbstractContextManager[None]:
+    def __call__(
+        self, cp_context: Generator[None, None, None] | None = None
+    ) -> contextlib.AbstractContextManager[None]:
         pass
 
 
 def get_train_context(enable_loss_parallel: bool) -> TrainContext:
     @contextlib.contextmanager
-    def context():
+    def context(cp_context: Generator[None, None, None] | None = None):
         with contextlib.ExitStack() as stack:
             if enable_loss_parallel:
                 stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
+
+            if cp_context:
+                logger.info(
+                    "Allowing torchtitan 0.2.0 context behavior via provided cp_context."
+                )
+                stack.enter_context(cp_context)
 
             yield
 
