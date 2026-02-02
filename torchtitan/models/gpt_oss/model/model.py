@@ -100,12 +100,15 @@ class Attention(nn.Module):
     Multi-head attention (MLA) module.
     """
 
-    def __init__(self, model_args: GptOssModelArgs):
+    def __init__(self, model_args: GptOssModelArgs, use_sliding_attention: bool):
         super().__init__()
         self.head_dim = model_args.head_dim
         self.n_heads = model_args.n_heads
         self.n_kv_heads = model_args.n_kv_heads
         self.enable_gqa = self.n_heads > self.n_kv_heads
+        self.use_sliding_attention = use_sliding_attention
+        self.attn_mask_type = model_args.attn_mask_type
+        self.sliding_window_size = model_args.sliding_window_size
 
         self.n_rep = self.n_heads // self.n_kv_heads
 
@@ -175,6 +178,25 @@ class Attention(nn.Module):
         xk = k.transpose(1, 2)  # (bs, n_kv_heads, seqlen, head_dim)
         xv = v.transpose(1, 2)  # (bs, n_kv_heads, seqlen, head_dim)
 
+        if attention_masks is None:
+            if self.attn_mask_type != "causal":
+                raise ValueError(
+                    "attention_masks is required for block_causal masks in gpt-oss."
+                )
+            mask_mods = [get_causal_mask_mod()]
+            if self.use_sliding_attention:
+                mask_mods.append(get_sliding_window_mask_mod(self.sliding_window_size))
+            attention_masks = create_attention_mask(
+                and_masks(*mask_mods),
+                1,
+                None,
+                seqlen,
+                seqlen,
+            )
+        elif isinstance(attention_masks, dict):
+            attention_masks = attention_masks[
+                "sliding_window_mask" if self.use_sliding_attention else "basic_mask"
+            ]
         assert isinstance(attention_masks, BlockMask), attention_masks
         output, lse = self.inner_attention(
             xq,
@@ -210,7 +232,9 @@ class TransformerBlock(nn.Module):
 
         super().__init__()
         self.use_sliding_attention = layer_id % 2 == 0
-        self.attention = Attention(model_args)
+        self.attention = Attention(
+            model_args, use_sliding_attention=self.use_sliding_attention
+        )
         self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
@@ -226,7 +250,7 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         rope_cache: torch.Tensor,
-        attention_masks: AttentionMasksType,
+        attention_masks: AttentionMasksType | None,
     ):
         """
         Forward pass for the Transformer block.
@@ -234,21 +258,12 @@ class TransformerBlock(nn.Module):
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
             rope_cache (torch.Tensor): Precomputed cosine and sine frequencies.
-            attention_masks (AttentionMasksType): a dict of BlockMasks.
+            attention_masks (AttentionMasksType | None): a dict of BlockMasks.
 
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-        # Extract the appropriate mask for this layer
-        if self.use_sliding_attention:
-            # pyrefly: ignore [missing-attribute]
-            layer_mask = attention_masks.get("sliding_window_mask", None)
-        else:
-            # pyrefly: ignore [missing-attribute]
-            layer_mask = attention_masks.get("basic_mask", None)
-        assert layer_mask is not None
-
-        x = x + self.attention(self.attention_norm(x), rope_cache, layer_mask)
+        x = x + self.attention(self.attention_norm(x), rope_cache, attention_masks)
         x = x + self.moe(self.ffn_norm(x))
         return x
 
@@ -368,14 +383,14 @@ class GptOssModel(ModelProtocol):
     def forward(
         self,
         tokens: torch.Tensor,
-        attention_masks: AttentionMasksType,
+        attention_masks: AttentionMasksType | None = None,
     ):
         """
         Forward pass for the Transformer model.
 
         Args:
             tokens (torch.Tensor): Input tensor of token IDs with shape (batch_size, seq_len).
-            attention_masks (AttentionMasksType): a dict of BlockMasks.
+            attention_masks (AttentionMasksType | None): a dict of BlockMasks.
 
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
