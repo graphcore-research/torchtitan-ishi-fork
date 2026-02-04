@@ -16,7 +16,7 @@ from torch.distributed.checkpoint._hf_utils import _metadata_fn
 from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 from torch.distributed.checkpoint.planner import LoadPlanner, ReadItem
 
-from .hf_storage import HuggingFaceStorageReader
+from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 
 
 logger: logging.Logger = logging.getLogger(__name__)
