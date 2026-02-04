@@ -49,7 +49,7 @@ class GptOssStateDictAdapter(MoEStateDictAdapter):
         Override default get_hf_storage_reader function to return QuantizedHFStorageReader.
         """
         if from_quantized:
-            from torch.distributed.checkpoint.quantized_hf_storage import (
+            from .quantized_hf_storage import (
                 QuantizedHuggingFaceStorageReader,
             )
 
